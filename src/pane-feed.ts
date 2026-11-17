@@ -21,7 +21,13 @@ export type FeedRecord =
       generation: number;
       startedAt: number;
     }
-  | { t: 'entry'; at: number; kind: ActivityEntry['kind']; text: string }
+  | {
+      t: 'entry';
+      at: number;
+      kind: ActivityEntry['kind'];
+      text: string;
+      id?: string;
+    }
   | {
       t: 'state';
       at: number;

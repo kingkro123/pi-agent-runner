@@ -245,6 +245,9 @@ export const runViewer = (options: ViewerOptions): Promise<void> => {
     history.push(render);
     if (history.length > MAX_HISTORY) history.shift();
   };
+  // The live stream line: one history slot, redrawn in place on every delta
+  let streamIsLast = false;
+  let streamRowStart = 0;
 
   // header, scroll region, body tail (bottom-aligned, as live output
   // leaves it) and footer, all with absolute positions
@@ -265,6 +268,10 @@ export const runViewer = (options: ViewerOptions): Promise<void> => {
         .concat(`\x1b[${bottom()};1H`)
         .join(''),
     );
+    if (streamIsLast) {
+      const last = history[history.length - 1](w).slice(-room);
+      streamRowStart = bottom() - last.length + 1;
+    }
     footer();
   };
 
@@ -278,6 +285,44 @@ export const runViewer = (options: ViewerOptions): Promise<void> => {
       return;
     }
     write(`\x1b[${bottom()};1H${lines.map((line) => `\n${line}`).join('')}`);
+    footer();
+  };
+
+  // First delta of a streamed tool call: like emit, but the line is a live
+  // slot that the following deltas replace in place.
+  const emitStream = (render: (width: number) => string[]): void => {
+    const room = Math.max(0, bottom() - HEADER_ROWS);
+    const lines = render(width()).slice(-room);
+    if (lines.length === 0) return;
+    remember(render);
+    if (!tty) {
+      write(`${lines.join('\n')}\n`);
+      return;
+    }
+    const first = bottom() - lines.length + 1;
+    write(`\x1b[${bottom()};1H${lines.map((line) => `\n${line}`).join('')}`);
+    streamRowStart = first;
+    streamIsLast = true;
+    footer();
+  };
+
+  // Later deltas: redraw the live slot in place, clearing the old lines.
+  const updateStream = (render: (width: number) => string[]): void => {
+    const room = Math.max(0, bottom() - HEADER_ROWS);
+    const lines = render(width()).slice(-room);
+    if (lines.length === 0) return;
+    history[history.length - 1] = render;
+    if (!tty) {
+      write(`${lines.join('\n')}\n`);
+      return;
+    }
+    const first = bottom() - lines.length + 1;
+    const top = Math.max(HEADER_ROWS + 1, Math.min(streamRowStart, first));
+    let out = '';
+    for (let row = top; row <= bottom(); row++) out += `\x1b[${row};1H\x1b[2K`;
+    out += lines.map((line, i) => `\x1b[${first + i};1H${line}`).join('');
+    write(out);
+    streamRowStart = first;
     footer();
   };
 
@@ -299,7 +344,14 @@ export const runViewer = (options: ViewerOptions): Promise<void> => {
       }
       setTitle(record);
     } else if (record.t === 'entry') {
-      emit((w) => entryLines(record, w, p, options.text));
+      const render = (w: number) => entryLines(record, w, p, options.text);
+      if (record.kind === 'stream') {
+        if (streamIsLast) updateStream(render);
+        else emitStream(render);
+      } else {
+        streamIsLast = false;
+        emit(render);
+      }
     } else if (record.t === 'state') {
       state = record;
       footer();

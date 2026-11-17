@@ -217,6 +217,9 @@ interface Pane {
   closed: boolean;
   closeTimer?: unknown;
   lastEntry?: ActivityEntry;
+  /** Text of `lastEntry` when it was flushed; a stream entry mutated in
+   * place since then gets re-emitted. */
+  lastEntryText?: string;
   lastState?: StateKey;
   lastStateAt: number;
   /** Everything of the run that the end record needs. */
@@ -367,7 +370,7 @@ const startPanes = (
     const buffer = activityOf(run.id) ?? [];
     const last = pane.lastEntry;
     const text = `generation ${run.generation} started`;
-    const from = last
+    let from = last
       ? lastIndex(buffer, (entry) => sameEntry(entry, last)) + 1
       : Math.max(
           0,
@@ -376,9 +379,21 @@ const startPanes = (
             (entry) => entry.kind === 'generation' && entry.text === text,
           ),
         );
+    // A stream entry flushed earlier and since mutated in place: same
+    // object, new text — re-emit just that one.
+    const tail = buffer[buffer.length - 1];
+    if (
+      last !== undefined &&
+      tail === last &&
+      tail.kind === 'stream' &&
+      pane.lastEntryText !== tail.text
+    ) {
+      from = buffer.length - 1;
+    }
     for (const entry of buffer.slice(from)) {
       pane.feed.write({ t: 'entry', ...entry });
       pane.lastEntry = entry;
+      pane.lastEntryText = entry.text;
     }
   };
 

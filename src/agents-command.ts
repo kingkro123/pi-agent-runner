@@ -127,6 +127,7 @@ const KINDS: Record<
   { mark: string; color: ThemeColor }
 > = {
   tool: { mark: '▸', color: 'text' },
+  stream: { mark: '✎', color: 'accent' },
   error: { mark: '✗', color: 'error' },
   text: { mark: '“', color: 'muted' },
   thought: { mark: '~', color: 'muted' },

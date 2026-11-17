@@ -53,9 +53,11 @@ export interface LiveRun {
 /** One line of a run's recent activity. */
 export interface ActivityEntry {
   at: number;
-  kind: 'tool' | 'error' | 'text' | 'thought' | 'generation';
+  kind: 'tool' | 'error' | 'text' | 'thought' | 'generation' | 'stream';
   /** A single line. */
   text: string;
+  /** Streamed tool key (name + target); the pane replaces its line. */
+  id?: string;
 }
 
 /** What the runner can do to a run that is in progress. */
@@ -81,6 +83,8 @@ const TEXT_CHARS = 200;
 const THOUGHT_CHARS = 120;
 const ARG_CHARS = 200;
 const JSON_ARG_CHARS = 80;
+/** Tail of a streaming file body shown on the stream line. */
+const STREAM_TAIL_CHARS = 80;
 /** A prompt still open after this long is dropped (lost decision event). */
 const PROMPT_CAP_MS = 30 * 60_000;
 
@@ -347,6 +351,102 @@ const thoughtsOf = (message: unknown) => {
     .filter(Boolean);
 };
 
+// Tool calls still being streamed in a partial assistant message.
+const toolCallsOf = (message: unknown) => {
+  const m = message as { role?: unknown; content?: unknown } | null;
+  if (m?.role !== 'assistant' || !Array.isArray(m.content)) return [];
+  return m.content
+    .map((block) => {
+      const b = block as {
+        type?: unknown;
+        name?: unknown;
+        arguments?: unknown;
+      } | null;
+      return b?.type === 'toolCall' && typeof b.name === 'string'
+        ? { name: b.name, arguments: b.arguments }
+        : undefined;
+    })
+    .filter((b): b is { name: string; arguments: unknown } => b !== undefined);
+};
+
+// The target a file-writing call is streaming into.
+const streamTarget = (args: unknown): string => {
+  if (typeof args !== 'object' || args === null) return '';
+  const a = args as Record<string, unknown>;
+  if (typeof a.path === 'string') return a.path;
+  if (typeof a.file_path === 'string') return a.file_path;
+  return '';
+};
+
+// One live line for a file-writing call whose args are still arriving:
+// the target, how much has streamed, and the newest tail of it.
+const streamLine = (name: string, args: unknown): string => {
+  if (typeof args !== 'object' || args === null) return '';
+  const a = args as Record<string, unknown>;
+  let file: string | undefined;
+  if (typeof a.path === 'string') {
+    file = a.path;
+  } else if (typeof a.file_path === 'string') {
+    file = a.file_path;
+  }
+  let content: string | undefined;
+  if (typeof a.content === 'string') {
+    content = a.content;
+  } else if (typeof a.newText === 'string') {
+    content = a.newText;
+  }
+  if (file === undefined || content === undefined) return '';
+  const tail = flat(content.slice(-STREAM_TAIL_CHARS));
+  return `${name} ${clipTo(file, 60)} — ${content.length} chars: ${tail}`;
+};
+
+// The rpc-mode `message_update` record carries no message; the streamed
+// tool-call args arrive as raw JSON text fragments in
+// `assistantMessageEvent.delta`. Reassemble them, tolerating a cut-off tail.
+const unescapeJsonString = (s: string): string =>
+  s.replace(/\\(u[0-9a-fA-F]{4}|[nrtbf\\"\\])/g, (m, g: string) => {
+    if (g === 'n') return '\n';
+    if (g === 'r') return '\r';
+    if (g === 't') return '\t';
+    if (g === 'b') return '\b';
+    if (g === 'f') return '\f';
+    if (g === '\\') return '\\';
+    if (g === '"') return '"';
+    if (g[0] === 'u') return String.fromCharCode(parseInt(g.slice(1), 16));
+    return m;
+  });
+
+const partialArgs = (raw: string): Record<string, unknown> | undefined => {
+  let args: Record<string, unknown> | undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      args = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // cut-off JSON: pull out the string fields we care about
+    const grab = (key: string): string | undefined => {
+      const closed = raw.match(
+        new RegExp(`"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`),
+      );
+      if (closed) return unescapeJsonString(closed[1]);
+      const open = raw.match(
+        new RegExp(`"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)$`),
+      );
+      return open ? unescapeJsonString(open[1]) : undefined;
+    };
+    const path = grab('path') ?? grab('file_path');
+    const content = grab('content') ?? grab('newText');
+    if (path !== undefined || content !== undefined) {
+      const out: Record<string, unknown> = {};
+      if (path !== undefined) out.path = path;
+      if (content !== undefined) out.content = content;
+      args = out;
+    }
+  }
+  return args;
+};
+
 const clipLine = (text: string, max: number) =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
@@ -383,6 +483,12 @@ export const trackRun = (spec: TrackSpec): Tracked => {
   notify(store);
 
   const tools = new Map<string, { name: string; action: string }>();
+  // tool key -> buffer index of its live stream entry
+  const streamSlot = new Map<string, number>();
+  // contentIndex -> raw streamed args JSON / tool name, for rpc-mode
+  // `message_update` records that carry `assistantMessageEvent` only
+  const streamRaw = new Map<number, string>();
+  const streamNames = new Map<number, string>();
   const record = (kind: ActivityEntry['kind'], text: string, at: number) => {
     buffer.push({ at, kind, text });
     if (buffer.length > MAX_ACTIVITY) buffer.shift();
@@ -426,6 +532,9 @@ export const trackRun = (spec: TrackSpec): Tracked => {
     generationStart() {
       const at = Date.now();
       tools.clear();
+      streamSlot.clear();
+      streamRaw.clear();
+      streamNames.clear();
       settled = zero();
       partial = zero();
       run.generation++;
@@ -486,13 +595,66 @@ export const trackRun = (spec: TrackSpec): Tracked => {
           run.lastStepAt = at;
         }
       } else if (type === 'message_update') {
-        const usage = assistantUsage(event.message);
+        const usage =
+          assistantUsage(event.message) ??
+          (event.usage as AssistantUsage | undefined);
         if (usage) {
           partial = totalsOf(usage);
           showTokens();
         }
         const thought = thoughtsOf(event.message).at(-1);
         if (thought) run.lastThought = clipLine(thought, THOUGHT_CHARS);
+        // Live preview of file-writing calls: replace the entry in place as
+        // the streamed args grow, so the pane shows one updating line.
+        const putStream = (name: string, args: unknown): void => {
+          const line = streamLine(name, args);
+          if (!line) return;
+          const key = `${name}:${clipTo(streamTarget(args), 60)}`;
+          const idx = streamSlot.get(key);
+          const slot = idx !== undefined ? buffer[idx] : undefined;
+          const last = buffer[buffer.length - 1];
+          if (slot && slot.kind === 'stream' && slot === last) {
+            slot.text = line;
+            slot.at = at;
+          } else {
+            record('stream', line, at);
+            const entry = buffer[buffer.length - 1];
+            entry.id = key;
+            streamSlot.set(key, buffer.length - 1);
+          }
+        };
+        for (const call of toolCallsOf(event.message)) {
+          putStream(call.name, call.arguments);
+        }
+        // rpc mode: no `message` on the record; the args stream in as raw
+        // JSON text fragments in `assistantMessageEvent.delta`, keyed by
+        // contentIndex, with the tool name on `toolcall_start`.
+        const ame = event.assistantMessageEvent as
+          | {
+              type?: unknown;
+              contentIndex?: unknown;
+              delta?: unknown;
+              toolName?: unknown;
+            }
+          | undefined;
+        if (ame && typeof ame.contentIndex === 'number') {
+          if (
+            ame.type === 'toolcall_start' &&
+            typeof ame.toolName === 'string'
+          ) {
+            streamNames.set(ame.contentIndex, ame.toolName);
+            streamRaw.set(ame.contentIndex, '');
+          } else if (
+            ame.type === 'toolcall_delta' &&
+            typeof ame.delta === 'string'
+          ) {
+            const idx = ame.contentIndex;
+            const raw = (streamRaw.get(idx) ?? '') + ame.delta;
+            streamRaw.set(idx, raw);
+            const args = partialArgs(raw);
+            if (args) putStream(streamNames.get(idx) ?? 'tool', args);
+          }
+        }
       } else if (type === 'message_end') {
         const usage = assistantUsage(event.message);
         if (usage) {
